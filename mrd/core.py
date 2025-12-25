@@ -214,7 +214,300 @@ def frob_margin_from_trace_estimates(trG: float, GF: float, RF: float, P: int):
     return mF, mu, A, alpha
 
 
-@torch.no_grad()
+def _rademacher_vec(shape, device, dtype):
+    return (torch.randint(0, 2, shape, device=device, dtype=torch.int8) * 2 - 1).to(
+        dtype
+    )
+
+
+def apply_model_H_mix(
+    model: nn.Module,
+    keys: List[str],
+    params: Dict[str, torch.Tensor],
+    Xb: torch.Tensor,
+    v_params: Dict[str, torch.Tensor],
+    task: Task,
+    num_classes: int = 10,
+    # b weights select “which outputs” you’re mixing (logits or scalar f)
+    b_override: Optional[torch.Tensor] = None,
+):
+    """
+    Returns a pytree representing:
+        Hv = ∇^2_θ s(θ) v
+    where
+        s(θ) = (1/B) Σ_n [ b_n f_n(θ) ]                      (regression)
+        s(θ) = (1/B) Σ_{n,k} [ b_{n,k} z_{n,k}(θ) ]          (classification)
+    with b being Rademacher weights (default).
+    This is *pure model curvature* (no residuals, no Fisher).
+    """
+    B = Xb.shape[0]
+    logits_fn = logits_fn_factory(model, Xb, task)
+
+    if task == "classification":
+        C = int(num_classes)
+        if b_override is None:
+            # b: (B,C) ±1
+            with torch.no_grad():
+                b = _rademacher_vec((B, C), Xb.device, logits_fn(params).dtype)
+        else:
+            b = b_override
+
+        def s_fn(p: Dict[str, torch.Tensor]) -> torch.Tensor:
+            z = logits_fn(p)  # (B,C)
+            return (b * z).sum() / B
+
+    else:
+        if b_override is None:
+            # b: (B,) ±1
+            with torch.no_grad():
+                z0 = logits_fn(params)  # (B,1)
+                b = _rademacher_vec((B,), Xb.device, z0.dtype)
+        else:
+            b = b_override.view(-1)
+
+        def s_fn(p: Dict[str, torch.Tensor]) -> torch.Tensor:
+            f = logits_fn(p)[:, 0]  # (B,)
+            return (b * f).sum() / B
+
+    grad_s = grad(s_fn)  # ∇ s
+    _, Hv = jvp(grad_s, (params,), (v_params,))  # ∇^2 s · v
+    return Hv
+
+
+def estimate_model_H_frob_mix(
+    model: nn.Module,
+    Xb: torch.Tensor,
+    task: Task,
+    K: int,
+    num_classes: int = 10,
+) -> float:
+    """
+    Hutchinson-style estimator of a *model curvature scale*:
+        H_mix_F ≈ sqrt( E_{b,v} || (∇^2 s_b) v ||^2 )
+    where s_b mixes samplewise (and logitwise) Hessians with random ±1 weights.
+
+    Interpretation:
+      - regression: probes typical size of samplewise Hessians H_n acting on random v
+      - classification: probes typical size of logit Hessians H_{n,k} acting on random v
+
+    This is not exactly ||H||_F for any single matrix; it’s a stable scalar
+    that tracks “how large model second derivatives are” in the same units as R_F.
+    """
+    keys = param_names(model)
+    params = params_from_model(model)
+
+    H2 = 0.0
+    for _ in range(K):
+        v = rademacher_like(params, keys)  # v ~ Rademacher in parameter space
+        Hv_tree = apply_model_H_mix(
+            model, keys, params, Xb, v, task=task, num_classes=num_classes
+        )
+        Hv = flatten_pytree(Hv_tree, keys)
+        H2 += float((Hv * Hv).sum().detach().cpu())
+    return math.sqrt(H2 / K)
+
+
+def estimate_T_action_frob(
+    model: nn.Module,
+    Xb: torch.Tensor,
+    yb: torch.Tensor,
+    task: Task,
+    K: int,
+    num_classes: int = 10,
+) -> float:
+    """
+    Optional: estimate || T[∇L] ||_F in a Hutchinson sense.
+
+    We compute (for random v) the vector:
+        w(v) = (d/dε)|_{0} [ H(θ + ε v) · g ]    where g = ∇L(θ)
+             = (∇^3 L)[v] · g   (a contraction producing a vector in parameter space)
+
+    Implementation: define hvp(theta, g) = ∇^2 L(theta) · g,
+    then take a JVP of hvp in direction v.
+
+    Cost: ~2–3x heavier than H_mix_F.
+    """
+    keys = param_names(model)
+    params = params_from_model(model)
+
+    # build loss function
+    logits_fn = logits_fn_factory(model, Xb, task)
+
+    def loss_fn(p: Dict[str, torch.Tensor]) -> torch.Tensor:
+        z = logits_fn(p)
+        if task == "classification":
+            return F.cross_entropy(z, yb.to(torch.long), reduction="mean")
+        else:
+            y = yb
+            if y.ndim == 2 and y.shape[1] == 1:
+                y = y[:, 0]
+            y = y.to(z.dtype).view(-1)
+            f = z[:, 0]
+            return 0.5 * ((f - y) ** 2).mean()
+
+    # gradient of loss
+    g_tree = grad(loss_fn)(params)
+    g_flat = flatten_pytree(g_tree, keys)
+
+    def hvp_of_loss(p: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # returns H(p) * g as a flat vector
+        def dot_grad(p2):
+            gg = grad(loss_fn)(p2)
+            return (flatten_pytree(gg, keys) * g_flat).sum()
+
+        Hv = grad(dot_grad)(p)  # ∇ [ <∇L, g> ] = H g
+        return flatten_pytree(Hv, keys)
+
+    # Hutchinson over v: E || JVP(hvp, v) ||^2
+    T2 = 0.0
+    for _ in range(K):
+        v = rademacher_like(params, keys)
+        v_flat = flatten_pytree(v, keys)
+        _, jvp_out = jvp(
+            hvp_of_loss, (params,), (v,)
+        )  # directional derivative of (H g)
+        T2 += float((jvp_out * jvp_out).sum().detach().cpu())
+
+    return math.sqrt(T2 / K)
+
+
+def estimate_model_curvature_F(
+    model: nn.Module,
+    params: Dict[str, torch.Tensor],
+    keys: List[str],
+    Xb: torch.Tensor,
+    K: int,
+    task: Task,
+    num_classes: int = 10,
+):
+    """
+    Estimates sqrt( (1/B) sum_n ||H_n||_F^2 )
+    via Hutchinson.
+    """
+    B = Xb.shape[0]
+    H2_acc = 0.0
+
+    logits_fn = logits_fn_factory(model, Xb, task)
+
+    for _ in range(K):
+        v = rademacher_like(params, keys)
+
+        if task == "classification":
+            # random contraction over classes
+            u = torch.randn(B, num_classes, device=Xb.device) / math.sqrt(num_classes)
+
+            def s_fn(p):
+                z = logits_fn(p)  # (B,C)
+                return (u * z).sum() / B
+
+        else:
+            # regression
+            u = torch.randn(B, device=Xb.device)
+
+            def s_fn(p):
+                f = logits_fn(p)[:, 0]  # (B,)
+                return (u * f).sum() / B
+
+        grad_s = grad(s_fn)
+        _, Hv = jvp(grad_s, (params,), (v,))
+        Hv_flat = flatten_pytree(Hv, keys)
+
+        H2_acc += float((Hv_flat * Hv_flat).sum().detach().cpu())
+
+    return math.sqrt(H2_acc / K)
+
+
+def _loss_from_logits(z, yb, task: str):
+    if task == "classification":
+        return F.cross_entropy(z, yb.to(torch.long), reduction="mean")
+    else:
+        # regression
+        if z.ndim == 2 and z.shape[1] == 1:
+            z = z[:, 0]
+        y = yb
+        if y.ndim == 2 and y.shape[1] == 1:
+            y = y[:, 0]
+        return F.mse_loss(z, y.to(z.dtype), reduction="mean")
+
+
+def apply_H_loss(
+    model, keys, params, Xb, yb, v_params, task: str, num_classes: int = 10
+):
+    """
+    Hv where H = ∂^2_θ L(θ) on batch (Xb,yb).
+    Works on older torch versions (no materialize_grads).
+    Returns a pytree dict matching `params`.
+    """
+    with torch.enable_grad():
+
+        def loss_fn(p):
+            z = functional_call(model, p, (Xb,))
+            if task == "classification":
+                # z: (B,C), y: (B,) long
+                return F.cross_entropy(z, yb.to(torch.long), reduction="mean")
+            else:
+                # regression
+                if z.ndim == 2 and z.shape[1] == 1:
+                    z = z[:, 0]
+                y = yb
+                if y.ndim == 2 and y.shape[1] == 1:
+                    y = y[:, 0]
+                return F.mse_loss(z, y.to(z.dtype), reduction="mean")
+
+        def grad_fn(p):
+            L = loss_fn(p)
+            inputs = tuple(p[k] for k in keys)
+
+            grads = torch.autograd.grad(
+                L,
+                inputs,
+                create_graph=True,  # needed for HVP via jvp
+                retain_graph=True,  # safer inside repeated probes
+                allow_unused=True,  # unused params -> None
+            )
+
+            # materialize Nones as real zeros (mutable tensors)
+            out = {}
+            for k, pk, gk in zip(keys, inputs, grads):
+                out[k] = torch.zeros_like(pk) if gk is None else gk
+            return out
+
+        _, Hv = jvp(grad_fn, (params,), (v_params,))
+        return Hv
+
+
+def estimate_H_loss_F(model, Xb, yb, K, task: str, num_classes: int = 10):
+    with torch.enable_grad():
+        model.eval()
+        keys = [k for k, _ in model.named_parameters()]
+        params = {k: v for k, v in model.named_parameters()}
+
+        H2 = 0.0
+        trH = 0.0
+        for _ in range(K):
+            v = {}
+            for k in keys:
+                t = params[k]
+                r = (
+                    torch.randint(0, 2, t.shape, device=t.device, dtype=torch.int8) * 2
+                    - 1
+                ).to(t.dtype)
+                v[k] = r
+
+            Hv = apply_H_loss(
+                model, keys, params, Xb, yb, v, task=task, num_classes=num_classes
+            )
+
+            vflat = torch.cat([v[k].reshape(-1) for k in keys])
+            Hvflat = torch.cat([Hv[k].reshape(-1) for k in keys])
+
+            H2 += float((Hvflat * Hvflat).sum().detach().cpu())
+            trH += float((vflat * Hvflat).sum().detach().cpu())
+
+        model.train()
+        return math.sqrt(H2 / K), (trH / K)
+
+
 def run_mrd_diagnostics(
     model: nn.Module,
     Xb: torch.Tensor,
@@ -223,22 +516,59 @@ def run_mrd_diagnostics(
     prev_snapshot: Optional[Dict[str, torch.Tensor]],
     task: Task,
     num_classes: int = 10,
+    # ---- extras
+    add_loss: bool = True,
+    estimate_model_curvature: bool = True,
+    estimate_third_deriv: bool = False,
 ):
     """
+    Full MRD diagnostics (task-aware) + optional model-curvature probes.
+
+    Requires these symbols already defined in your file:
+      - params_from_model, param_names, flatten_pytree, copy_params, rademacher_like
+      - logits_fn_factory, apply_G, apply_R
+      - frob_margin_from_trace_estimates
+      - apply_model_H_mix, estimate_model_H_frob_mix, estimate_T_action_frob
+        (the model-curvature code I gave you)
+
     Returns:
-      G_F, trG, R_F, m_F, mu, A, alpha,
-      plus FD channel norms if prev_snapshot exists:
-        Phi_align_F_fd, Phi_damp_F_fd, Phi_trans_F_fd
+      out: dict with (always) P,batch,G_F,trG,R_F,m_F,mu,A,alpha and (optional) loss,H_mix_F,T_action_F
+           and (optional, if prev_snapshot) Phi_align_F_fd,Phi_damp_F_fd,Phi_trans_F_fd
+      snap: dict(params_prev=copy_params(params))
     """
     model.eval()
     keys = param_names(model)
     params = params_from_model(model)
     P = sum(params[k].numel() for k in keys)
+    B = int(Xb.shape[0])
 
-    # ---- ||G||_F and tr(G) via Hutchinson
+    # ---- task-aware forward for loss / FD weights
+    logits_fn = logits_fn_factory(model, Xb, task)
+
+    out: Dict[str, float] = dict(P=P, batch=B)
+
+    # ============================================================
+    # (0) Loss on this probe batch
+    # ============================================================
+    if add_loss:
+        z = logits_fn(params)
+        if task == "classification":
+            loss = F.cross_entropy(z, yb.to(torch.long), reduction="mean")
+        else:
+            y = yb
+            if y.ndim == 2 and y.shape[1] == 1:
+                y = y[:, 0]
+            y = y.to(z.dtype).view(-1)
+            f = z[:, 0]
+            loss = 0.5 * ((f - y) ** 2).mean()
+        out["loss"] = float(loss.detach().cpu())
+
+    # ============================================================
+    # (1) Metric curvature: ||G||_F and tr(G) via Hutchinson
+    # ============================================================
     GF2 = 0.0
     trG_acc = 0.0
-    for _ in range(K):
+    for _ in range(int(K)):
         v = rademacher_like(params, keys)
         Gv_tree, vTAv = apply_G(model, keys, params, Xb, v, task=task)
         Gv = flatten_pytree(Gv_tree, keys)
@@ -246,10 +576,14 @@ def run_mrd_diagnostics(
         trG_acc += float(vTAv.detach().cpu())
     G_F = math.sqrt(GF2 / K)
     trG = trG_acc / K
+    out["G_F"] = G_F
+    out["trG"] = trG
 
-    # ---- ||R||_F via Hutchinson
+    # ============================================================
+    # (2) Residual curvature: ||R||_F via Hutchinson
+    # ============================================================
     RF2 = 0.0
-    for _ in range(K):
+    for _ in range(int(K)):
         v = rademacher_like(params, keys)
         Rv_tree = apply_R(
             model, keys, params, Xb, yb, v, task=task, num_classes=num_classes
@@ -257,67 +591,99 @@ def run_mrd_diagnostics(
         Rv = flatten_pytree(Rv_tree, keys)
         RF2 += float((Rv * Rv).sum().detach().cpu())
     R_F = math.sqrt(RF2 / K)
+    out["R_F"] = R_F
 
+    # ============================================================
+    # (3) Frobenius margin m_F and components
+    # ============================================================
     m_F, mu, A, alpha = frob_margin_from_trace_estimates(trG, G_F, R_F, P)
-    out = dict(
-        P=P,
-        batch=int(Xb.shape[0]),
-        G_F=G_F,
-        trG=trG,
-        R_F=R_F,
-        m_F=m_F,
-        mu=mu,
-        A=A,
-        alpha=alpha,
-    )
+    out["m_F"] = float(m_F)
+    out["mu"] = float(mu)
+    out["A"] = float(A)
+    out["alpha"] = float(alpha)
 
-    # ---- Finite-difference channel norms
+    # ============================================================
+    # (4) Optional: "model curvature" probes (pure output-Hessian scale)
+    # ============================================================
+    if estimate_model_curvature:
+        H_mix_F = estimate_model_H_frob_mix(
+            model, Xb, task=task, K=K, num_classes=num_classes
+        )
+        out["H_mix_F"] = float(H_mix_F)
+
+    if estimate_third_deriv:
+        T_action_F = estimate_T_action_frob(
+            model, Xb, yb, task=task, K=K, num_classes=num_classes
+        )
+        out["T_action_F"] = float(T_action_F)
+
+    # ============================================================
+    # (5) Optional: "model curvature" probes (pure output-Hessian scale)
+    # ============================================================
+    # out["H_loss_F"], out["trH_est"] = estimate_H_loss_F(model, Xb, yb, K, task, num_classes)
+    # H2 = 0.0
+    # trH = 0.0
+    # for _ in range(K):
+    #     v = rademacher_like(params, keys)
+    #     Hv = apply_H_loss(model, keys, params, Xb, yb, v, task, num_classes)
+    #     vflat  = flatten_pytree(v, keys)
+    #     Hvflat = flatten_pytree(Hv, keys)
+    #     H2  += float((Hvflat*Hvflat).sum())
+    #     trH += float((vflat*Hvflat).sum())
+    # out["H_loss_F"] = torch.sqrt(H2 / K)
+    # out["trH_est"]  = trH / K
+
+    # ============================================================
+    # (6) Optional: finite-difference channel norms (requires snapshot)
+    # ============================================================
     if prev_snapshot is not None and "params_prev" in prev_snapshot:
         params_prev = prev_snapshot["params_prev"]
 
-        # Phi_align v ≈ G_now v - G_prev v
-        def Phi_align_Av(v):
-            Gv_now, _ = apply_G(model, keys, params, Xb, v, task=task)
-            Gv_prev, _ = apply_G(model, keys, params_prev, Xb, v, task=task)
+        # ---- Phi_align v ≈ G_now v - G_prev v
+        def Phi_align_Av(v_params):
+            Gv_now, _ = apply_G(model, keys, params, Xb, v_params, task=task)
+            Gv_prev, _ = apply_G(model, keys, params_prev, Xb, v_params, task=task)
             return {k: (Gv_now[k] - Gv_prev[k]) for k in keys}
 
-        # Build weights for damp/trans splits
-        logits_fn_now = logits_fn_factory(model, Xb, task)
-        z_now = logits_fn_now(params)
-        z_prev = logits_fn_now(params_prev)
+        # ---- weights for damping/transport splits
+        z_now = logits_fn(params)
+        z_prev = logits_fn(params_prev)
 
         if task == "classification":
             C = int(num_classes)
-            p_now = torch.softmax(z_now, dim=1)
-            p_prev = torch.softmax(z_prev, dim=1)
-            y_oh = F.one_hot(yb.to(torch.long), num_classes=C).to(p_now.dtype)
-            a_now = p_now - y_oh
-            a_prev = p_prev - y_oh
-            da = a_now - a_prev
+            y_long = yb.to(torch.long)
+
+            with torch.no_grad():
+                p_now = torch.softmax(z_now, dim=1)
+                p_prev = torch.softmax(z_prev, dim=1)
+                y_oh = F.one_hot(y_long, num_classes=C).to(p_now.dtype)
+                a_now = p_now - y_oh
+                a_prev = p_prev - y_oh
+                da = a_now - a_prev
 
             # Phi_damp v ≈ H_{da}(params_now) v
-            def Phi_damp_Av(v):
+            def Phi_damp_Av(v_params):
                 return apply_R(
                     model,
                     keys,
                     params,
                     Xb,
-                    yb,
-                    v,
+                    y_long,
+                    v_params,
                     task=task,
                     num_classes=C,
                     a_override=da,
                 )
 
             # Phi_trans v ≈ H_{a_prev}(params_now) v - H_{a_prev}(params_prev) v
-            def Phi_trans_Av(v):
+            def Phi_trans_Av(v_params):
                 Rv_now = apply_R(
                     model,
                     keys,
                     params,
                     Xb,
-                    yb,
-                    v,
+                    y_long,
+                    v_params,
                     task=task,
                     num_classes=C,
                     a_override=a_prev,
@@ -327,8 +693,8 @@ def run_mrd_diagnostics(
                     keys,
                     params_prev,
                     Xb,
-                    yb,
-                    v,
+                    y_long,
+                    v_params,
                     task=task,
                     num_classes=C,
                     a_override=a_prev,
@@ -341,26 +707,44 @@ def run_mrd_diagnostics(
             if y.ndim == 2 and y.shape[1] == 1:
                 y = y[:, 0]
             y = y.to(z_now.dtype).view(-1)
-            e_now = (z_now[:, 0] - y).detach()
-            e_prev = (z_prev[:, 0] - y).detach()
-            de = e_now - e_prev  # damping weights
 
-            def Phi_damp_Av(v):
-                return apply_R(model, keys, params, Xb, yb, v, task=task, a_override=de)
+            with torch.no_grad():
+                e_now = (z_now[:, 0] - y).detach()
+                e_prev = (z_prev[:, 0] - y).detach()
+                de = e_now - e_prev
 
-            def Phi_trans_Av(v):
+            def Phi_damp_Av(v_params):
+                return apply_R(
+                    model,
+                    keys,
+                    params,
+                    Xb,
+                    yb,
+                    v_params,
+                    task=task,
+                    a_override=de,
+                )
+
+            def Phi_trans_Av(v_params):
                 Rv_now = apply_R(
-                    model, keys, params, Xb, yb, v, task=task, a_override=e_prev
+                    model, keys, params, Xb, yb, v_params, task=task, a_override=e_prev
                 )
                 Rv_prev = apply_R(
-                    model, keys, params_prev, Xb, yb, v, task=task, a_override=e_prev
+                    model,
+                    keys,
+                    params_prev,
+                    Xb,
+                    yb,
+                    v_params,
+                    task=task,
+                    a_override=e_prev,
                 )
                 return {k: (Rv_now[k] - Rv_prev[k]) for k in keys}
 
         Pa2 = 0.0
         Pd2 = 0.0
         Pt2 = 0.0
-        for _ in range(K):
+        for _ in range(int(K)):
             v = rademacher_like(params, keys)
             Pav = flatten_pytree(Phi_align_Av(v), keys)
             Pdv = flatten_pytree(Phi_damp_Av(v), keys)

@@ -1,44 +1,52 @@
-from __future__ import annotations
-
-from typing import Dict, List, Optional
-
-import lightning.pytorch as pl
-from lightning.pytorch.callbacks import Callback
-import pandas as pd
 import torch
 import torch.nn.functional as F
+import pandas as pd
+from typing import Optional, Dict, List
+from lightning.pytorch.callbacks import Callback
 
+# assumes run_mrd_diagnostics is in scope
 from mrd.core import run_mrd_diagnostics
 
 
 class MRDDiagnosticsCallback(Callback):
+    """
+    Logs MRD probes + loss on the same diagnostic batch every `every_n_steps`.
+
+    Notes:
+      - Uses a single forward for loss (no-grad) separate from MRD (grad-enabled).
+      - Leaves pl_module/model training mode unchanged (restores previous mode).
+      - For regression, logs MSE (not 0.5*MSE unless you change it).
+    """
+
     def __init__(self, every_n_steps: int, diag_bs: int, K: int):
         super().__init__()
         self.every_n_steps = int(every_n_steps)
         self.diag_bs = int(diag_bs)
         self.K = int(K)
-
         self.snapshot: Optional[Dict[str, torch.Tensor]] = None
         self.rows: List[dict] = []
 
     @torch.no_grad()
     def _compute_loss(self, pl_module, xb: torch.Tensor, yb: torch.Tensor) -> float:
+        was_training = pl_module.model.training
         pl_module.model.eval()
+
         z = pl_module.model(xb)
 
         if pl_module.task == "classification":
-            # z: (B,C), y: (B,) int64
-            loss = F.cross_entropy(z, yb.to(torch.long))
+            # z: (B,C), y: (B,) int
+            loss = F.cross_entropy(z, yb.to(torch.long), reduction="mean")
         else:
-            # regression: z: (B,) or (B,1), y: (B,) or (B,1) float
+            # regression: allow (B,) or (B,1)
             if z.ndim == 2 and z.shape[1] == 1:
                 z = z[:, 0]
             y = yb
             if y.ndim == 2 and y.shape[1] == 1:
                 y = y[:, 0]
-            loss = F.mse_loss(z, y.to(z.dtype))
+            y = y.to(z.dtype)
+            loss = F.mse_loss(z, y, reduction="mean")
 
-        pl_module.model.train()
+        pl_module.model.train(was_training)
         return float(loss.detach().cpu())
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -46,43 +54,42 @@ class MRDDiagnosticsCallback(Callback):
         if step == 0 or (step % self.every_n_steps) != 0:
             return
 
+        # --- get a diagnostic batch
         dm = trainer.datamodule
         loader = dm.train_dataloader()
         xb, yb = next(iter(loader))
         xb = xb[: self.diag_bs].to(pl_module.device, non_blocking=True)
         yb = yb[: self.diag_bs].to(pl_module.device, non_blocking=True)
 
-        # loss on the same diag batch (no-grad)
+        # --- loss on same diag batch (no grad)
         loss_val = self._compute_loss(pl_module, xb, yb)
         loss_name = "cross_entropy" if pl_module.task == "classification" else "mse"
 
-        # Ensure correct dtype for CE targets for probes
-        if pl_module.task == "classification":
-            yb = yb.to(torch.long)
-
-        # MRD probes need grads enabled
+        # --- MRD probes (need grads)
+        yb_probe = yb.to(torch.long) if pl_module.task == "classification" else yb
         with torch.enable_grad():
             diag, self.snapshot = run_mrd_diagnostics(
                 pl_module.model,
                 xb,
-                yb,
+                yb_probe,
                 K=self.K,
                 prev_snapshot=self.snapshot,
                 task=pl_module.task,
-                num_classes=getattr(pl_module, "num_classes", 10),
+                num_classes=int(getattr(pl_module, "num_classes", 10)),
+                add_loss=False,  # avoid double-computing loss inside run_mrd_diagnostics
             )
 
-        row = dict(step=step, loss=loss_val, loss_name=loss_name, **diag)
+        row = dict(step=step, loss=float(loss_val), loss_name=loss_name, **diag)
         self.rows.append(row)
 
-        # log MRD scalars
+        # --- log MRD scalars
         for k, v in diag.items():
             if isinstance(v, (float, int)):
                 pl_module.log(
                     f"mrd/{k}", float(v), prog_bar=False, on_step=True, on_epoch=False
                 )
 
-        # log loss too
+        # --- log loss too
         pl_module.log(
             "mrd/loss", float(loss_val), prog_bar=False, on_step=True, on_epoch=False
         )
