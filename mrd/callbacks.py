@@ -3,9 +3,11 @@ import torch.nn.functional as F
 import pandas as pd
 from typing import Optional, Dict, List
 from lightning.pytorch.callbacks import Callback
+import lightning as pl
 
 # assumes run_mrd_diagnostics is in scope
 from mrd.core import run_mrd_diagnostics
+from mrd.core_exact import exact_eig_extrema_HGR_Hztheta
 
 
 class MRDDiagnosticsCallback(Callback):
@@ -94,5 +96,99 @@ class MRDDiagnosticsCallback(Callback):
             "mrd/loss", float(loss_val), prog_bar=False, on_step=True, on_epoch=False
         )
 
+    def dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows)
+
+
+class ExactCurvatureCallback(Callback):
+    """
+    Exact (batch-level) curvature diagnostics.
+
+    For each trigger step, computes exact eigen-extrema of:
+      - H        = ∂²_θ L
+      - G        = Jᵀ (∂²_z L) J
+      - R        = H − G
+      - Hztheta  = ∂²_θ s(theta),  s = mean(vec(z))
+
+    Stores everything in a single table with columns:
+      stage, step, batch_idx, H_lmin, H_lmax, G_lmin, ...
+    """
+
+    def __init__(
+        self,
+        every_n_steps: int = 100,
+        max_batches: Optional[int] = None,   # limit cost
+    ):
+        super().__init__()
+        self.every_n_steps = int(every_n_steps)
+        self.max_batches = max_batches
+        self.rows: List[Dict] = []
+
+    # -------------------------------------------------
+    # shared driver
+    # -------------------------------------------------
+    def _run(
+        self,
+        stage: str,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        batch,
+        batch_idx: int,
+    ):
+        step = int(trainer.global_step)
+
+        if stage == "train":
+            if step == 0 or step % self.every_n_steps != 0:
+                return
+        else:
+            if self.max_batches is not None and batch_idx >= self.max_batches:
+                return
+
+        xb, yb = batch
+        xb = xb.to(pl_module.device)
+        yb = yb.to(pl_module.device)
+
+        with torch.enable_grad():
+            stats = exact_eig_extrema_HGR_Hztheta(
+                model=pl_module.model,
+                inputs=xb,
+                targets=yb,
+                loss_fn=pl_module.loss_fn,
+            )
+
+        row = dict(
+            stage=stage,
+            step=step,
+            batch_idx=int(batch_idx),
+            **stats,
+        )
+        self.rows.append(row)
+
+        # optional Lightning logging
+        for k, v in stats.items():
+            if isinstance(v, float):
+                pl_module.log(
+                    f"curv/{k}",
+                    v,
+                    on_step=(stage == "train"),
+                    on_epoch=(stage != "train"),
+                    prog_bar=False,
+                )
+
+    # -------------------------------------------------
+    # hooks
+    # -------------------------------------------------
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self._run("train", trainer, pl_module, batch, batch_idx)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self._run("val", trainer, pl_module, batch, batch_idx)
+
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self._run("test", trainer, pl_module, batch, batch_idx)
+
+    # -------------------------------------------------
+    # export
+    # -------------------------------------------------
     def dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.rows)
